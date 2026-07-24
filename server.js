@@ -31,15 +31,16 @@ const STORE_FILE = path.join(__dirname, "schedule-store.json");
 const SEVEN_DAYS_MS = 7 * 24 * 60 * 60 * 1000;
 
 // ---------- STATE (persisted to disk so a simple process restart can recover) ----------
-let state = { pending: [], delivered: [] };
+let state = { pending: [], delivered: [], activityLog: [] };
 
 function loadState() {
   try {
     if (fs.existsSync(STORE_FILE)) {
       state = JSON.parse(fs.readFileSync(STORE_FILE, "utf8"));
+      if (!state.activityLog) state.activityLog = [];
     }
   } catch {
-    state = { pending: [], delivered: [] };
+    state = { pending: [], delivered: [], activityLog: [] };
   }
 }
 
@@ -49,6 +50,17 @@ function saveState() {
   } catch (err) {
     console.error("Could not save state to disk:", err.message);
   }
+}
+
+function maskKey(key) {
+  if (!key || key.length <= 8) return "****";
+  return `${key.slice(0, 4)}...${key.slice(-4)}`;
+}
+
+function logActivity(entry) {
+  state.activityLog.unshift({ timestamp: Date.now(), ...entry });
+  if (state.activityLog.length > 300) state.activityLog.length = 300;
+  saveState();
 }
 
 loadState();
@@ -75,6 +87,9 @@ app.post("/proxy", async (req, res) => {
   }
   try {
     const data = await callPanel(baseUrl, params);
+    if (params.action === "balance") {
+      logActivity({ type: "connect", baseUrl, keyMasked: maskKey(params.key) });
+    }
     res.json(data);
   } catch (err) {
     res.status(502).json({ error: `Could not reach the panel: ${err.message}` });
@@ -107,6 +122,18 @@ app.post("/schedule-order", (req, res) => {
   }));
 
   state.pending.push(...scheduled);
+
+  scheduled.forEach((leg) => {
+    logActivity({
+      type: "order",
+      baseUrl,
+      keyMasked: maskKey(apiKey),
+      link: leg.link,
+      quantity: leg.quantity,
+      serviceLabel: leg.serviceLabel,
+    });
+  });
+
   saveState();
 
   res.json({ scheduled: scheduled.length });
@@ -131,6 +158,15 @@ app.get("/pending-count", (req, res) => {
   const link = req.query.link;
   const count = link ? state.pending.filter((p) => p.link === link).length : state.pending.length;
   res.json({ pending: count });
+});
+
+app.get("/delivered-log", (req, res) => {
+  const cutoff = Date.now() - SEVEN_DAYS_MS;
+  res.json(state.delivered.filter((d) => d.timestamp >= cutoff));
+});
+
+app.get("/activity-log", (req, res) => {
+  res.json(state.activityLog.slice(0, 100));
 });
 
 app.get("/", (req, res) => {
