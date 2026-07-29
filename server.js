@@ -1,21 +1,22 @@
 // ==========================================
-// KM Panel — API Proxy + Scheduler
+// KM Panel — API Proxy + Order Scheduler
 // ==========================================
 // 1. Proxies balance/services/add calls to any SMM panel (fixes CORS).
 // 2. Accepts a full order's legs in one go and schedules them SERVER-SIDE,
-//    so delivery keeps happening even if the website's tab is closed.
-// 3. Keeps a short delivered-history log so the Tracker tab can show real
-//    data for a link even after the browser was closed while it fired.
+//    grouped as an "order" that can be paused, resumed, or deleted from
+//    the Schedules tab — so delivery keeps happening even if the
+//    browser tab is closed, and can be controlled at any time.
+// 3. Keeps a short delivered-history log (Tracker tab) and a full
+//    activity log of connects + orders (Schedules tab, password gated
+//    client-side).
 //
 // Run locally:   npm install   then   npm start
-// Deploy free:   Render.com / Railway.app as a Node web service
-//                (Build: npm install, Start: npm start)
+// Deploy free:   push this folder to Render.com or Railway.app as a
+//                Node web service (Build: npm install, Start: npm start)
 //
-// IMPORTANT LIMITATION: free hosting plans (like Render's free tier)
-// put the server to sleep after ~15 minutes with no incoming requests.
+// IMPORTANT: free hosting plans sleep after ~15 min with no requests.
 // While asleep, scheduled legs will NOT fire. Use a free uptime pinger
-// (e.g. UptimeRobot hitting this URL every 10 minutes) to keep it awake
-// for the full 12-24h delivery window.
+// (e.g. UptimeRobot hitting this URL every 10 minutes) during delivery.
 
 const express = require("express");
 const cors = require("cors");
@@ -31,16 +32,22 @@ const STORE_FILE = path.join(__dirname, "schedule-store.json");
 const SEVEN_DAYS_MS = 7 * 24 * 60 * 60 * 1000;
 
 // ---------- STATE (persisted to disk so a simple process restart can recover) ----------
-let state = { pending: [], delivered: [], activityLog: [] };
+// orders: [{ id, name, link, baseUrl, apiKey, status: 'active'|'paused'|'completed',
+//            createdAt, legs: [{ id, serviceId, category, serviceLabel, quantity, fireAt, fired }] }]
+let state = { orders: [], delivered: [], activityLog: [] };
 
 function loadState() {
   try {
     if (fs.existsSync(STORE_FILE)) {
-      state = JSON.parse(fs.readFileSync(STORE_FILE, "utf8"));
-      if (!state.activityLog) state.activityLog = [];
+      const loaded = JSON.parse(fs.readFileSync(STORE_FILE, "utf8"));
+      state = {
+        orders: loaded.orders || [],
+        delivered: loaded.delivered || [],
+        activityLog: loaded.activityLog || [],
+      };
     }
   } catch {
-    state = { pending: [], delivered: [], activityLog: [] };
+    state = { orders: [], delivered: [], activityLog: [] };
   }
 }
 
@@ -52,15 +59,9 @@ function saveState() {
   }
 }
 
-function maskKey(key) {
-  if (!key || key.length <= 8) return "****";
-  return `${key.slice(0, 4)}...${key.slice(-4)}`;
-}
-
 function logActivity(entry) {
   state.activityLog.unshift({ timestamp: Date.now(), ...entry });
   if (state.activityLog.length > 300) state.activityLog.length = 300;
-  saveState();
 }
 
 loadState();
@@ -88,7 +89,8 @@ app.post("/proxy", async (req, res) => {
   try {
     const data = await callPanel(baseUrl, params);
     if (params.action === "balance") {
-      logActivity({ type: "connect", baseUrl, keyMasked: maskKey(params.key) });
+      logActivity({ type: "connect", baseUrl, apiKey: params.key });
+      saveState();
     }
     res.json(data);
   } catch (err) {
@@ -97,50 +99,117 @@ app.post("/proxy", async (req, res) => {
 });
 
 // ==========================================
-// POST /schedule-order — accepts a full order's legs and schedules
-// them server-side. Works even if the browser is closed afterwards.
-// body: { baseUrl, apiKey, legs: [{ serviceId, link, quantity, category, serviceLabel, fireInMs }] }
+// POST /schedule-order — creates a new order (a group of legs) and
+// schedules it server-side. Shows up immediately in GET /orders.
+// body: { name, baseUrl, apiKey, link, legs: [{ serviceId, link, quantity, category, serviceLabel, fireInMs }] }
 // ==========================================
 app.post("/schedule-order", (req, res) => {
-  const { baseUrl, apiKey, legs } = req.body || {};
+  const { name, baseUrl, apiKey, link, legs } = req.body || {};
 
   if (!baseUrl || !apiKey || !Array.isArray(legs) || legs.length === 0) {
     return res.status(400).json({ error: "Missing baseUrl, apiKey, or legs array." });
   }
 
   const now = Date.now();
-  const scheduled = legs.map((leg) => ({
-    id: `${now}_${Math.random().toString(36).slice(2, 9)}`,
-    baseUrl,
-    apiKey,
+  const orderId = `order_${now}_${Math.random().toString(36).slice(2, 8)}`;
+
+  const orderLegs = legs.map((leg, i) => ({
+    id: `${orderId}_leg${i}`,
     serviceId: leg.serviceId,
-    link: leg.link,
+    link: leg.link || link,
     quantity: leg.quantity,
     category: leg.category,
     serviceLabel: leg.serviceLabel,
     fireAt: now + (leg.fireInMs || 0),
+    fired: false,
   }));
 
-  state.pending.push(...scheduled);
+  state.orders.push({
+    id: orderId,
+    name: name || "Untitled schedule",
+    link: link || (legs[0] && legs[0].link) || "",
+    baseUrl,
+    apiKey,
+    status: "active",
+    createdAt: now,
+    legs: orderLegs,
+  });
 
-  scheduled.forEach((leg) => {
-    logActivity({
-      type: "order",
-      baseUrl,
-      keyMasked: maskKey(apiKey),
-      link: leg.link,
-      quantity: leg.quantity,
-      serviceLabel: leg.serviceLabel,
-    });
+  logActivity({
+    type: "order",
+    baseUrl,
+    apiKey,
+    link: link || (legs[0] && legs[0].link) || "",
+    legCount: orderLegs.length,
+    totalQuantity: orderLegs.reduce((a, l) => a + l.quantity, 0),
   });
 
   saveState();
-
-  res.json({ scheduled: scheduled.length });
+  res.json({ orderId, scheduled: orderLegs.length });
 });
 
 // ==========================================
-// GET /history?link=... — delivered legs for a link, last 7 days
+// GET /orders — every order with computed progress, for the Schedules tab
+// ==========================================
+app.get("/orders", (req, res) => {
+  const now = Date.now();
+
+  const orders = state.orders.map((order) => {
+    const totalLegs = order.legs.length;
+    const doneLegs = order.legs.filter((l) => l.fired).length;
+
+    const upcoming = order.legs.filter((l) => !l.fired).sort((a, b) => a.fireAt - b.fireAt);
+    const nextFireAt = upcoming.length > 0 ? upcoming[0].fireAt : null;
+
+    const byCategory = {};
+    order.legs.forEach((l) => {
+      byCategory[l.category] = (byCategory[l.category] || 0) + l.quantity;
+    });
+
+    return {
+      id: order.id,
+      name: order.name,
+      link: order.link,
+      status: order.status,
+      createdAt: order.createdAt,
+      doneLegs,
+      totalLegs,
+      nextFireAt,
+      byCategory,
+    };
+  });
+
+  res.json(orders);
+});
+
+// ==========================================
+// Pause / Resume / Delete an order
+// ==========================================
+app.post("/orders/:id/pause", (req, res) => {
+  const order = state.orders.find((o) => o.id === req.params.id);
+  if (!order) return res.status(404).json({ error: "Order not found." });
+  order.status = "paused";
+  saveState();
+  res.json({ ok: true });
+});
+
+app.post("/orders/:id/resume", (req, res) => {
+  const order = state.orders.find((o) => o.id === req.params.id);
+  if (!order) return res.status(404).json({ error: "Order not found." });
+  order.status = "active";
+  saveState();
+  res.json({ ok: true });
+});
+
+app.delete("/orders/:id", (req, res) => {
+  const before = state.orders.length;
+  state.orders = state.orders.filter((o) => o.id !== req.params.id);
+  saveState();
+  res.json({ deleted: before !== state.orders.length });
+});
+
+// ==========================================
+// GET /history?link=... — delivered legs for a link, last 7 days (Tracker tab)
 // ==========================================
 app.get("/history", (req, res) => {
   const link = req.query.link;
@@ -152,21 +221,20 @@ app.get("/history", (req, res) => {
 });
 
 // ==========================================
-// GET /pending-count?link=... — how many legs are still queued for a link
+// GET /delivered-log — every delivered leg, all links, last 7 days (Logs tab)
 // ==========================================
-app.get("/pending-count", (req, res) => {
-  const link = req.query.link;
-  const count = link ? state.pending.filter((p) => p.link === link).length : state.pending.length;
-  res.json({ pending: count });
-});
-
 app.get("/delivered-log", (req, res) => {
   const cutoff = Date.now() - SEVEN_DAYS_MS;
   res.json(state.delivered.filter((d) => d.timestamp >= cutoff));
 });
 
+// ==========================================
+// GET /activity-log — full connects + orders log, WITH the real API key
+// (this endpoint is only ever surfaced behind the client-side Schedules
+// password gate — it's the owner's own panel activity, not public)
+// ==========================================
 app.get("/activity-log", (req, res) => {
-  res.json(state.activityLog.slice(0, 100));
+  res.json(state.activityLog.slice(0, 150));
 });
 
 app.get("/", (req, res) => {
@@ -174,48 +242,59 @@ app.get("/", (req, res) => {
 });
 
 // ==========================================
-// BACKGROUND SCHEDULER LOOP
+// BACKGROUND SCHEDULER LOOP — only fires legs belonging to ACTIVE orders
 // ==========================================
 async function processDueLegs() {
   const now = Date.now();
-  const due = state.pending.filter((leg) => leg.fireAt <= now);
-  if (due.length === 0) return;
+  let changed = false;
 
-  for (const leg of due) {
-    try {
-      const data = await callPanel(leg.baseUrl, {
-        key: leg.apiKey,
-        action: "add",
-        service: leg.serviceId,
-        link: leg.link,
-        quantity: leg.quantity,
-      });
-      state.delivered.push({
-        link: leg.link,
-        category: leg.category,
-        amount: leg.quantity,
-        timestamp: now,
-        order: data.order || null,
-      });
-      console.log(`Delivered ${leg.quantity} ${leg.serviceLabel} for ${leg.link} — order #${data.order || "?"}`);
-    } catch (err) {
-      console.error(`Failed to deliver leg for ${leg.link}: ${err.message}`);
-      // still record it as delivered=false isn't tracked separately here to keep things simple;
-      // it's dropped after this attempt rather than retried indefinitely.
+  for (const order of state.orders) {
+    if (order.status !== "active") continue; // paused orders are skipped entirely
+
+    const due = order.legs.filter((l) => !l.fired && l.fireAt <= now);
+    if (due.length === 0) continue;
+
+    for (const leg of due) {
+      try {
+        const data = await callPanel(order.baseUrl, {
+          key: order.apiKey,
+          action: "add",
+          service: leg.serviceId,
+          link: leg.link,
+          quantity: leg.quantity,
+        });
+        state.delivered.push({
+          link: leg.link,
+          category: leg.category,
+          amount: leg.quantity,
+          timestamp: now,
+          order: data.order || null,
+        });
+        console.log(`Delivered ${leg.quantity} ${leg.serviceLabel} for ${leg.link} — order #${data.order || "?"}`);
+      } catch (err) {
+        console.error(`Failed to deliver leg for ${leg.link}: ${err.message}`);
+      }
+      leg.fired = true;
+      changed = true;
+    }
+
+    // mark the order completed once every leg has fired
+    if (order.legs.every((l) => l.fired)) {
+      order.status = "completed";
+      changed = true;
     }
   }
 
-  state.pending = state.pending.filter((leg) => leg.fireAt > now);
-
-  const historyCutoff = now - SEVEN_DAYS_MS;
-  state.delivered = state.delivered.filter((d) => d.timestamp >= historyCutoff);
-
-  saveState();
+  if (changed) {
+    const historyCutoff = now - SEVEN_DAYS_MS;
+    state.delivered = state.delivered.filter((d) => d.timestamp >= historyCutoff);
+    saveState();
+  }
 }
 
 setInterval(processDueLegs, 15000); // check every 15 seconds
 
 app.listen(PORT, () => {
   console.log(`KM Panel proxy listening on http://localhost:${PORT}`);
-  console.log(`Loaded ${state.pending.length} pending leg(s) from disk.`);
+  console.log(`Loaded ${state.orders.length} order(s) from disk.`);
 });
