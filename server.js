@@ -244,51 +244,63 @@ app.get("/", (req, res) => {
 // ==========================================
 // BACKGROUND SCHEDULER LOOP — only fires legs belonging to ACTIVE orders
 // ==========================================
+let isProcessingLegs = false;
+
 async function processDueLegs() {
-  const now = Date.now();
-  let changed = false;
-
-  for (const order of state.orders) {
-    if (order.status !== "active") continue; // paused orders are skipped entirely
-
-    const due = order.legs.filter((l) => !l.fired && l.fireAt <= now);
-    if (due.length === 0) continue;
-
-    for (const leg of due) {
-      try {
-        const data = await callPanel(order.baseUrl, {
-          key: order.apiKey,
-          action: "add",
-          service: leg.serviceId,
-          link: leg.link,
-          quantity: leg.quantity,
-        });
-        state.delivered.push({
-          link: leg.link,
-          category: leg.category,
-          amount: leg.quantity,
-          timestamp: now,
-          order: data.order || null,
-        });
-        console.log(`Delivered ${leg.quantity} ${leg.serviceLabel} for ${leg.link} — order #${data.order || "?"}`);
-      } catch (err) {
-        console.error(`Failed to deliver leg for ${leg.link}: ${err.message}`);
-      }
-      leg.fired = true;
-      changed = true;
-    }
-
-    // mark the order completed once every leg has fired
-    if (order.legs.every((l) => l.fired)) {
-      order.status = "completed";
-      changed = true;
-    }
+  if (isProcessingLegs) {
+    console.log("Previous processDueLegs run still in progress — skipping this tick to avoid double-firing.");
+    return;
   }
+  isProcessingLegs = true;
 
-  if (changed) {
+  try {
+    const now = Date.now();
+
+    for (const order of state.orders) {
+      if (order.status !== "active") continue; // paused orders are skipped entirely
+
+      const due = order.legs.filter((l) => !l.fired && l.fireAt <= now);
+      if (due.length === 0) continue;
+
+      for (const leg of due) {
+        // mark fired FIRST and persist immediately, so even if this exact
+        // request is slow, no other tick (or a restart) can pick this leg up again
+        leg.fired = true;
+        saveState();
+
+        try {
+          const data = await callPanel(order.baseUrl, {
+            key: order.apiKey,
+            action: "add",
+            service: leg.serviceId,
+            link: leg.link,
+            quantity: leg.quantity,
+          });
+          state.delivered.push({
+            link: leg.link,
+            category: leg.category,
+            amount: leg.quantity,
+            timestamp: now,
+            order: data.order || null,
+          });
+          console.log(`Delivered ${leg.quantity} ${leg.serviceLabel} for ${leg.link} — order #${data.order || "?"}`);
+        } catch (err) {
+          console.error(`Failed to deliver leg for ${leg.link}: ${err.message}`);
+        }
+        saveState();
+      }
+
+      if (order.legs.every((l) => l.fired)) {
+        order.status = "completed";
+        saveState();
+      }
+    }
+
     const historyCutoff = now - SEVEN_DAYS_MS;
     state.delivered = state.delivered.filter((d) => d.timestamp >= historyCutoff);
     saveState();
+  } finally {
+    isProcessingLegs = false;
   }
 }
 
