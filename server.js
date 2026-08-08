@@ -106,8 +106,8 @@ app.post("/proxy", async (req, res) => {
 app.post("/schedule-order", (req, res) => {
   const { name, baseUrl, apiKey, link, legs } = req.body || {};
 
-  if (!baseUrl || !apiKey || !Array.isArray(legs) || legs.length === 0) {
-    return res.status(400).json({ error: "Missing baseUrl, apiKey, or legs array." });
+  if (!Array.isArray(legs) || legs.length === 0 || (!baseUrl && !legs.every((l) => l.baseUrl && l.apiKey))) {
+    return res.status(400).json({ error: "Missing baseUrl/apiKey (order-level or per-leg), or legs array." });
   }
 
   const now = Date.now();
@@ -120,6 +120,8 @@ app.post("/schedule-order", (req, res) => {
     quantity: leg.quantity,
     category: leg.category,
     serviceLabel: leg.serviceLabel,
+    baseUrl: leg.baseUrl || baseUrl,
+    apiKey: leg.apiKey || apiKey,
     fireAt: now + (leg.fireInMs || 0),
     fired: false,
   }));
@@ -137,8 +139,8 @@ app.post("/schedule-order", (req, res) => {
 
   logActivity({
     type: "order",
-    baseUrl,
-    apiKey,
+    baseUrl: baseUrl || "multiple panels",
+    apiKey: apiKey || "(per-leg)",
     link: link || (legs[0] && legs[0].link) || "",
     legCount: orderLegs.length,
     totalQuantity: orderLegs.reduce((a, l) => a + l.quantity, 0),
@@ -269,8 +271,8 @@ async function processDueLegs() {
         saveState();
 
         try {
-          const data = await callPanel(order.baseUrl, {
-            key: order.apiKey,
+          const data = await callPanel(leg.baseUrl || order.baseUrl, {
+            key: leg.apiKey || order.apiKey,
             action: "add",
             service: leg.serviceId,
             link: leg.link,
