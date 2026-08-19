@@ -22,6 +22,7 @@ const express = require("express");
 const cors = require("cors");
 const fs = require("fs");
 const path = require("path");
+const startAutoEngine = require("./render-auto-engine");
 
 const app = express();
 app.use(cors());
@@ -311,4 +312,5 @@ setInterval(processDueLegs, 15000); // check every 15 seconds
 app.listen(PORT, () => {
   console.log(`KM Panel proxy listening on http://localhost:${PORT}`);
   console.log(`Loaded ${state.orders.length} order(s) from disk.`);
+  startAutoEngine();
 });
