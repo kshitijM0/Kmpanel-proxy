@@ -57,7 +57,11 @@ async function attemptPlaceOrder(svc, link, orderId, legId) {
     return;
   }
 
-  const result = await providerApi.placeOrder(svc.provider_id, svc.provider_service_id, link, svc.quantity);
+  // Custom-comments services need the actual comment lines passed alongside
+  // the add call. Only present on a Comments leg_service (see legGenerator);
+  // every other service leaves `extra` empty so their calls are unchanged.
+  const extra = svc.comments ? { comments: svc.comments } : {};
+  const result = await providerApi.placeOrder(svc.provider_id, svc.provider_service_id, link, svc.quantity, extra);
 
   if (result.ok) {
     await supabase.from("leg_services").update({
